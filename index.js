@@ -1,1329 +1,1104 @@
-'use strict';
 
-require('dotenv').config();
-
-const fs = require('fs');
-const path = require('path');
-const http = require('http');
 const {
-  Client,
-  Events,
-  GatewayIntentBits,
-  Partials,
-  EmbedBuilder,
-} = require('discord.js');
+    Client,
+    GatewayIntentBits,
+    EmbedBuilder,
+    PermissionsBitField
+} = require("discord.js");
 
-/* ------------------------------------------------------------------ */
-/* Configuration                                                       */
-/* ------------------------------------------------------------------ */
+const fs = require("fs");
+const path = require("path");
+const http = require("http");
 
-const PREFIX = '?';
-const PERIOD_MS = 10 * 60 * 60 * 1000;
-const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000;
-const MAX_REASON_LENGTH = 400;
+require("dotenv").config();
 
-const TOKEN = process.env.TOKEN;
+// ==========================================
+// CONFIGURATION PRINCIPALE
+// ==========================================
 
-// Role used for the peasant joke.
-const MEMBER_ROLE_ID = process.env.MEMBER_ID_ROLE || process.env.MEMBER_ROLE_ID;
+const PREFIX = "?";
+const TOKEN = process.env.DISCORD_TOKEN;
+const PORT = process.env.PORT || 3000;
 
-const PEASANT_MESSAGE =
-  'Shut up peasant, come back when you will pass your mod application.';
+if (!TOKEN) {
+    console.error("ERROR: DISCORD_TOKEN is missing from environment variables.");
+    process.exit(1);
+}
 
-// Persistent storage location.
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const DATA_FILE = path.join(DATA_DIR, 'limits.json');
-const WARNINGS_FILE = path.join(DATA_DIR, 'warnings.json');
-
-// Staff ranks, highest first.
-const RANK_DEFINITIONS = [
-  {
-    key: 'owner',
-    name: 'Owner',
-    level: 5,
-    roleId: process.env.OWNER_ROLE_ID,
-    limits: { ban: Infinity, kick: Infinity, mute: Infinity, warn: Infinity },
-  },
-  {
-    key: 'supervisor',
-    name: 'Supervisor',
-    level: 4,
-    roleId: process.env.SUPERVISOR_ROLE_ID,
-    limits: { ban: 5, kick: 7, mute: 12, warn: 15 },
-  },
-  {
-    key: 'senior_moderator',
-    name: 'Senior Moderator',
-    level: 3,
-    roleId: process.env.SENIOR_MODERATOR_ROLE_ID,
-    limits: { ban: 3, kick: 5, mute: 8, warn: 10 },
-  },
-  {
-    key: 'moderator',
-    name: 'Moderator',
-    level: 2,
-    roleId: process.env.MODERATOR_ROLE_ID,
-    limits: { ban: 2, kick: 3, mute: 5, warn: 6 },
-  },
-  {
-    key: 'trial_moderator',
-    name: 'Trial Moderator',
-    level: 1,
-    roleId: process.env.TRIAL_MODERATOR_ROLE_ID,
-    limits: { ban: 1, kick: 2, mute: 3, warn: 4 },
-  },
-];
-
-const RANKS = RANK_DEFINITIONS.filter((rank) => {
-  if (!rank.roleId) {
-    console.warn(
-      `[config] Missing role ID for rank "${rank.name}". This rank is disabled.`
-    );
-    return false;
-  }
-
-  return true;
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
 });
 
-// Optional extra staff roles.
-const EXTRA_STAFF_ROLE_IDS = (process.env.EXTRA_STAFF_ROLE_IDS || '')
-  .split(',')
-  .map((id) => id.trim())
-  .filter(Boolean);
+// ==========================================
+// STAFF ROLES
+// ==========================================
 
-// Roles that cannot be targeted by moderation commands.
-const PROTECTED_ROLE_IDS = (process.env.PROTECTED_ROLE_IDS || '')
-  .split(',')
-  .map((id) => id.trim())
-  .filter(Boolean);
-
-const ACTION_LABELS = {
-  ban: 'Ban',
-  kick: 'Kick',
-  mute: 'Mute',
-  warn: 'Warn',
+const STAFF_ROLES = {
+    OWNER: process.env.OWNER_ROLE_ID,
+    SUPERVISOR: process.env.SUPERVISOR_ROLE_ID,
+    SENIOR_MODERATOR: process.env.SENIOR_MODERATOR_ROLE_ID,
+    MODERATOR: process.env.MODERATOR_ROLE_ID,
+    TRIAL_MODERATOR: process.env.TRIAL_MODERATOR_ROLE_ID
 };
 
-const ACTION_PLURALS = {
-  ban: 'Bans',
-  kick: 'Kicks',
-  mute: 'Mutes',
-  warn: 'Warns',
+const RANK_LEVELS = {
+    OWNER: 5,
+    SUPERVISOR: 4,
+    SENIOR_MODERATOR: 3,
+    MODERATOR: 2,
+    TRIAL_MODERATOR: 1
 };
 
-const ACTION_PAST = {
-  ban: 'banned',
-  kick: 'kicked',
-  mute: 'muted',
-  warn: 'warned',
+const ACTION_LIMITS = {
+    OWNER: Infinity,
+    SUPERVISOR: 30,
+    SENIOR_MODERATOR: 20,
+    MODERATOR: 12,
+    TRIAL_MODERATOR: 5
 };
 
-const KNOWN_COMMANDS = [
-  'ban',
-  'kick',
-  'mute',
-  'warn',
-  'unban',
-  'unmute',
-  'limits',
-  'help',
-  'checkthisfemboy',
-];
+const LIMIT_DURATION = 10 * 60 * 60 * 1000;
 
-/* ------------------------------------------------------------------ */
-/* Persistent storage                                                  */
-/* ------------------------------------------------------------------ */
+// ==========================================
+// DATA FILES
+// ==========================================
 
-let store = {};
-let warnings = {};
+const DATA_FOLDER = path.join(__dirname, "data");
 
-function readJsonFile(file, label) {
-  try {
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+if (!fs.existsSync(DATA_FOLDER)) {
+    fs.mkdirSync(DATA_FOLDER, { recursive: true });
+}
+
+const LIMITS_FILE = path.join(DATA_FOLDER, "limits.json");
+const WARNINGS_FILE = path.join(DATA_FOLDER, "warnings.json");
+const SANCTIONS_FILE = path.join(DATA_FOLDER, "sanctions.json");
+
+function loadJSON(file, defaultValue = {}) {
+    try {
+        if (!fs.existsSync(file)) {
+            fs.writeFileSync(file, JSON.stringify(defaultValue, null, 4));
+            return defaultValue;
+        }
+
+        const content = fs.readFileSync(file, "utf8");
+
+        if (!content.trim()) {
+            return defaultValue;
+        }
+
+        return JSON.parse(content);
+    } catch (error) {
+        console.error(`Failed to load ${path.basename(file)}:`, error);
+        return defaultValue;
+    }
+}
+
+function saveJSON(file, data) {
+    try {
+        fs.writeFileSync(file, JSON.stringify(data, null, 4));
+    } catch (error) {
+        console.error(`Failed to save ${path.basename(file)}:`, error);
+    }
+}
+
+// ==========================================
+// DATABASES
+// ==========================================
+
+let limitsData = {};
+let warningsData = {};
+let sanctionsData = {};
+
+function loadAllData() {
+    limitsData = loadJSON(LIMITS_FILE, {});
+    warningsData = loadJSON(WARNINGS_FILE, {});
+    sanctionsData = loadJSON(SANCTIONS_FILE, {});
+
+    console.log("All moderation databases loaded.");
+}
+
+function saveAllData() {
+    saveJSON(LIMITS_FILE, limitsData);
+    saveJSON(WARNINGS_FILE, warningsData);
+    saveJSON(SANCTIONS_FILE, sanctionsData);
+}
+
+// ==========================================
+// STAFF RANK SYSTEM
+// ==========================================
+
+function getStaffRank(member) {
+    if (!member) return null;
+
+    if (STAFF_ROLES.OWNER && member.roles.cache.has(STAFF_ROLES.OWNER)) {
+        return "OWNER";
+    }
+
+    if (STAFF_ROLES.SUPERVISOR && member.roles.cache.has(STAFF_ROLES.SUPERVISOR)) {
+        return "SUPERVISOR";
+    }
 
     if (
-      typeof data !== 'object' ||
-      data === null ||
-      Array.isArray(data)
+        STAFF_ROLES.SENIOR_MODERATOR &&
+        member.roles.cache.has(STAFF_ROLES.SENIOR_MODERATOR)
     ) {
-      throw new Error('Invalid format');
+        return "SENIOR_MODERATOR";
     }
 
-    return data;
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      console.error(
-        `[storage] Could not read the ${label} file. Starting from an empty one.`,
-        error.message
-      );
-
-      try {
-        fs.copyFileSync(file, `${file}.corrupt-${Date.now()}`);
-      } catch (_) {
-        // Ignore backup failure.
-      }
+    if (STAFF_ROLES.MODERATOR && member.roles.cache.has(STAFF_ROLES.MODERATOR)) {
+        return "MODERATOR";
     }
 
-    return {};
-  }
+    if (
+        STAFF_ROLES.TRIAL_MODERATOR &&
+        member.roles.cache.has(STAFF_ROLES.TRIAL_MODERATOR)
+    ) {
+        return "TRIAL_MODERATOR";
+    }
+
+    return null;
 }
 
-// Atomic write.
-function writeJsonFile(file, data) {
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
+function hasPermission(rank, minimumRank) {
+    if (!rank || !RANK_LEVELS[rank]) return false;
 
-    const tmp = `${file}.tmp`;
-
-    fs.writeFileSync(
-      tmp,
-      JSON.stringify(data, null, 2)
-    );
-
-    fs.renameSync(tmp, file);
-  } catch (error) {
-    console.error(
-      `[storage] Could not write ${path.basename(file)}:`,
-      error.message
-    );
-  }
+    return RANK_LEVELS[rank] >= RANK_LEVELS[minimumRank];
 }
 
-function loadStore() {
-  store = readJsonFile(DATA_FILE, 'limits');
-}
+// ==========================================
+// MODERATION HISTORY
+// ==========================================
 
-function saveStore() {
-  writeJsonFile(DATA_FILE, store);
-}
+function addSanction(targetId, type, moderatorId, reason) {
+    if (!sanctionsData[targetId]) {
+        sanctionsData[targetId] = [];
+    }
 
-function loadWarnings() {
-  warnings = readJsonFile(WARNINGS_FILE, 'warnings');
-}
+    sanctionsData[targetId].push({
+        type,
+        moderatorId,
+        reason: reason || "No reason provided",
+        timestamp: Date.now()
+    });
 
-function saveWarnings() {
-  writeJsonFile(WARNINGS_FILE, warnings);
+    saveJSON(SANCTIONS_FILE, sanctionsData);
 }
 
 function addWarning(targetId, moderatorId, reason) {
-  if (!Array.isArray(warnings[targetId])) {
-    warnings[targetId] = [];
-  }
+    if (!warningsData[targetId]) {
+        warningsData[targetId] = [];
+    }
 
-  warnings[targetId].push({
-    moderatorId,
-    reason,
-    timestamp: Date.now(),
-  });
-
-  saveWarnings();
-}
-
-// Returns the staff member's record.
-function getRecord(userId) {
-  const now = Date.now();
-  let record = store[userId];
-
-  if (
-    !record ||
-    typeof record.resetAt !== 'number' ||
-    now >= record.resetAt
-  ) {
-    record = {
-      resetAt: now + PERIOD_MS,
-      ban: 0,
-      kick: 0,
-      mute: 0,
-      warn: 0,
+    const warning = {
+        moderatorId,
+        reason: reason || "No reason provided",
+        timestamp: Date.now()
     };
 
-    store[userId] = record;
-    saveStore();
-  }
+    warningsData[targetId].push(warning);
 
-  for (const key of ['ban', 'kick', 'mute', 'warn']) {
-    if (typeof record[key] !== 'number') {
-      record[key] = 0;
-    }
-  }
+    addSanction(
+        targetId,
+        "WARN",
+        moderatorId,
+        reason
+    );
 
-  return record;
+    saveJSON(WARNINGS_FILE, warningsData);
+
+    return warning;
 }
 
-function resetTimestamp(record) {
-  return Math.floor(record.resetAt / 1000);
+// ==========================================
+// GENERAL UTILITIES
+// ==========================================
+
+function formatDate(timestamp) {
+    return new Date(timestamp).toLocaleString("en-US", {
+        dateStyle: "medium",
+        timeStyle: "short"
+    });
 }
 
-/* ------------------------------------------------------------------ */
-/* Per-moderator lock                                                  */
-/* ------------------------------------------------------------------ */
+function getUserId(input) {
+    if (!input) return null;
 
-const locks = new Map();
+    const mention = input.match(/^<@!?(\d+)>$/);
 
-function withLock(key, task) {
-  const previous = locks.get(key) || Promise.resolve();
+    if (mention) return mention[1];
 
-  const run = previous.catch(() => {}).then(task);
-  const tail = run.catch(() => {});
-
-  locks.set(key, tail);
-
-  tail.then(() => {
-    if (locks.get(key) === tail) {
-      locks.delete(key);
-    }
-  });
-
-  return run;
-}
-
-/* ------------------------------------------------------------------ */
-/* Client and helpers                                                  */
-/* ------------------------------------------------------------------ */
-
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildModeration,
-    GatewayIntentBits.MessageContent,
-  ],
-
-  partials: [
-    Partials.Channel,
-    Partials.Message,
-  ],
-
-  allowedMentions: {
-    parse: [],
-    repliedUser: false,
-  },
-});
-
-function getRank(member) {
-  if (!member) return null;
-
-  for (const rank of RANKS) {
-    if (member.roles.cache.has(rank.roleId)) {
-      return rank;
-    }
-  }
-
-  return null;
-}
-
-function hasExtraStaffRole(member) {
-  return EXTRA_STAFF_ROLE_IDS.some((roleId) =>
-    member.roles.cache.has(roleId)
-  );
-}
-
-function formatLimit(value) {
-  return value === Infinity ? 'Unlimited' : String(value);
-}
-
-function parseUserId(arg) {
-  if (!arg) return null;
-
-  const match =
-    arg.match(/^<@!?(\d{17,20})>$/) ||
-    arg.match(/^(\d{17,20})$/);
-
-  return match ? match[1] : null;
-}
-
-function parseDuration(arg) {
-  if (!arg) return null;
-
-  const match = arg.match(/^(\d+)(s|m|h|d)$/i);
-
-  if (!match) return null;
-
-  const value = Number(match[1]);
-  const unit = match[2].toLowerCase();
-
-  const multipliers = {
-    s: 1000,
-    m: 60 * 1000,
-    h: 60 * 60 * 1000,
-    d: 24 * 60 * 60 * 1000,
-  };
-
-  const ms = value * multipliers[unit];
-
-  if (ms < 1000 || ms > MAX_TIMEOUT_MS) {
-    return null;
-  }
-
-  return ms;
-}
-
-function clip(text, max) {
-  if (!text) return '';
-
-  return text.length > max
-    ? `${text.slice(0, max - 3)}...`
-    : text;
-}
-
-function cleanReason(text, fallback = 'No reason provided') {
-  const value = (text || '').trim();
-
-  return value
-    ? clip(value, MAX_REASON_LENGTH)
-    : fallback;
-}
-
-function auditReason(moderatorTag, reason) {
-  return clip(`${moderatorTag}: ${reason}`, 512);
-}
-
-function infoEmbed(title, description, color = 0x2b2d31) {
-  return new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(description)
-    .setColor(color);
-}
-
-function errorEmbed(description) {
-  return infoEmbed('Error', description, 0xed4245);
-}
-
-function reply(message, embed) {
-  return message.reply({
-    embeds: [embed],
-  }).catch((error) => {
-    console.error('[reply] Could not reply:', error.message);
-    return null;
-  });
-}
-
-// Discord message/moderation logging has been disabled.
-async function sendLog() {
-  return;
-}
-/* ------------------------------------------------------------------ */
-/* Target validation                                                   */
-/* ------------------------------------------------------------------ */
-
-async function resolveTarget(guild, arg) {
-  const id = parseUserId(arg);
-
-  if (!id) return null;
-
-  const member = await guild.members.fetch(id).catch(() => null);
-
-  let user = member ? member.user : null;
-
-  if (!user) {
-    user = await client.users.fetch(id).catch(() => null);
-  }
-
-  return {
-    id,
-    member,
-    user,
-  };
-}
-
-// Returns an error string, or null when the target is valid.
-function checkTarget(guild, moderatorMember, moderatorRank, target, type) {
-  if (target.id === moderatorMember.id) {
-    return 'You cannot moderate yourself.';
-  }
-
-  if (target.id === client.user.id) {
-    return 'You cannot moderate the bot.';
-  }
-
-  if (target.id === guild.ownerId) {
-    return 'This user is protected and cannot be moderated.';
-  }
-
-  if (!target.member) {
-    if (
-      type === 'kick' ||
-      type === 'mute' ||
-      type === 'warn'
-    ) {
-      return 'This user is not a member of the server.';
-    }
+    if (/^\d{17,20}$/.test(input)) return input;
 
     return null;
-  }
-
-  const member = target.member;
-
-  if (
-    PROTECTED_ROLE_IDS.some((roleId) =>
-      member.roles.cache.has(roleId)
-    )
-  ) {
-    return 'This user is protected and cannot be moderated.';
-  }
-
-  const targetRank = getRank(member);
-
-  if (
-    targetRank &&
-    targetRank.level >= moderatorRank.level
-  ) {
-    return 'You cannot moderate a member of equal or higher staff rank.';
-  }
-
-  const isGuildOwner = moderatorMember.id === guild.ownerId;
-
-  if (
-    !isGuildOwner &&
-    moderatorMember.roles.highest.position <=
-      member.roles.highest.position
-  ) {
-    return 'You cannot moderate a member whose highest role is equal to or above yours.';
-  }
-
-  if (type === 'ban' && !member.bannable) {
-    return 'I am not able to ban this member.';
-  }
-
-  if (type === 'kick' && !member.kickable) {
-    return 'I am not able to kick this member.';
-  }
-
-  if (type === 'mute' && !member.moderatable) {
-    return 'I am not able to mute this member.';
-  }
-
-  return null;
 }
 
-/* ------------------------------------------------------------------ */
-/* Limited action runner                                               */
-/* ------------------------------------------------------------------ */
+function createEmbed(title, description, color = 0x2B2D31) {
+    return new EmbedBuilder()
+        .setTitle(title)
+        .setDescription(description)
+        .setColor(color)
+        .setTimestamp();
+}
 
-function runLimitedAction({
-  message,
-  rank,
-  type,
-  target,
-  reason,
-  perform,
-}) {
-  const moderator = message.author;
+function isStaff(member) {
+    return Boolean(getStaffRank(member));
+}
 
-  return withLock(moderator.id, async () => {
-    const limit = rank.limits[type];
-    const unlimited = limit === Infinity;
+// ==========================================
+// STAFF ACTION LIMITS
+// ==========================================
 
-    const record = unlimited
-      ? null
-      : getRecord(moderator.id);
+function getStaffUsage(userId) {
+    const now = Date.now();
+    let record = limitsData[userId];
 
-    if (!unlimited && record[type] >= limit) {
-      const usage = `${record[type]}/${limit}`;
+    if (!record || now >= record.resetAt) {
+        record = {
+            count: 0,
+            resetAt: now + LIMIT_DURATION
+        };
 
-      await reply(
-        message,
-        infoEmbed(
-          'Moderation Limit Reached',
-          `You have reached your ${type} limit for this 10-hour period.\n\n` +
-            `**Current usage:** ${usage}\n` +
-            `**Next reset:** <t:${resetTimestamp(record)}:R>\n\n` +
-            'You may use other moderation commands if their independent limits have not been reached.',
-          0xed4245
-        )
-      );
-
-      return false;
+        limitsData[userId] = record;
+        saveJSON(LIMITS_FILE, limitsData);
     }
 
-    // Reserve the allowance before executing.
-    if (!unlimited) {
-      record[type] += 1;
-      saveStore();
+    return record;
+}
+
+function getRemainingActions(rank, userId) {
+    if (rank === "OWNER") return Infinity;
+
+    const limit = ACTION_LIMITS[rank];
+    const usage = getStaffUsage(userId);
+
+    return Math.max(0, limit - usage.count);
+}
+
+async function runLimitedAction(
+    message,
+    rank,
+    target,
+    type,
+    reason,
+    perform
+) {
+    const limit = ACTION_LIMITS[rank];
+
+    if (limit !== Infinity) {
+        const usage = getStaffUsage(message.author.id);
+
+        if (usage.count >= limit) {
+            return message.reply(
+                `You have reached your ${limit} moderation actions limit.`
+            );
+        }
+
+        usage.count++;
+        saveJSON(LIMITS_FILE, limitsData);
     }
 
     try {
-      await perform();
-    } catch (error) {
-      // Failed sanctions never consume an allowance.
-      if (!unlimited) {
-        record[type] = Math.max(
-          0,
-          record[type] - 1
+        await perform();
+
+        if (type !== "WARN") {
+            addSanction(
+                target.id,
+                type,
+                message.author.id,
+                reason
+            );
+        }
+
+        const embed = createEmbed(
+            "Moderation Action",
+            `**Action:** ${type}\n` +
+            `**Member:** ${target.user?.tag || target.tag || target.id}\n` +
+            `**Moderator:** ${message.author.tag}\n` +
+            `**Reason:** ${reason}`,
+            0x57F287
         );
 
-        saveStore();
-      }
+        await message.reply({ embeds: [embed] });
 
-      console.error(
-        `[${type}] Action failed:`,
-        error.message
-      );
+    } catch (error) {
+        console.error(`Moderation error (${type}):`, error);
 
-      await reply(
-        message,
-        errorEmbed(
-          'The action could not be completed. No moderation allowance was used.'
-        )
-      );
+        const usage = getStaffUsage(message.author.id);
 
-      return false;
+        if (limit !== Infinity && usage.count > 0) {
+            usage.count--;
+            saveJSON(LIMITS_FILE, limitsData);
+        }
+
+        await message.reply(
+            "An error occurred while executing this moderation action."
+        );
+    }
+}
+
+// ==========================================
+// ARGUMENT HELPERS
+// ==========================================
+
+function getTargetFromMessage(message, args) {
+    const targetId = getUserId(args[0]);
+
+    if (!targetId) return null;
+
+    return message.guild.members.cache.get(targetId) || null;
+}
+
+function getReason(args, startIndex = 1) {
+    return args.slice(startIndex).join(" ") || "No reason provided";
+}
+
+async function checkStaff(message, minimumRank = "TRIAL_MODERATOR") {
+    const rank = getStaffRank(message.member);
+
+    if (!rank || !hasPermission(rank, minimumRank)) {
+        await message.reply("You do not have permission to use this command.");
+        return null;
     }
 
-    const usage = unlimited
-      ? 'Unlimited'
-      : `${record[type]}/${limit}`;
-
-    await reply(
-      message,
-      infoEmbed(
-        `${ACTION_LABELS[type]} Successful`,
-        `${target.tag || target.id} has been ${ACTION_PAST[type]}.\n\n` +
-          `**Reason:** ${reason}\n` +
-          `**${ACTION_PLURALS[type]} used:** ${usage}` +
-          (unlimited
-            ? ''
-            : `\n**Next reset:** <t:${resetTimestamp(record)}:R>`),
-        0x57f287
-      )
-    );
-
-    return true;
-  });
+    return rank;
 }
 
-/* ------------------------------------------------------------------ */
-/* Moderation commands                                                 */
-/* ------------------------------------------------------------------ */
+// ==========================================
+// BAN COMMAND
+// ?ban @member reason
+// ==========================================
 
 async function handleBan(message, args, rank) {
-  const target = await resolveTarget(
-    message.guild,
-    args[0]
-  );
+    if (!args[0]) {
+        return message.reply("Usage: `?ban @member [reason]`");
+    }
 
-  if (!target) {
-    return reply(
-      message,
-      errorEmbed(
-        'Usage: `?ban <user mention or ID> [reason]`'
-      )
+    const target = getTargetFromMessage(message, args);
+
+    if (!target) {
+        return message.reply("Member not found in this server.");
+    }
+
+    if (target.id === message.author.id) {
+        return message.reply("You cannot ban yourself.");
+    }
+
+    if (!target.bannable) {
+        return message.reply("I cannot ban this member. Check my role position and permissions.");
+    }
+
+    const reason = getReason(args);
+
+    await runLimitedAction(
+        message,
+        rank,
+        target,
+        "BAN",
+        reason,
+        async () => {
+            await target.ban({ reason });
+        }
     );
-  }
-
-  const reason = cleanReason(
-    args.slice(1).join(' ')
-  );
-
-  const problem = checkTarget(
-    message.guild,
-    message.member,
-    rank,
-    target,
-    'ban'
-  );
-
-  if (problem) {
-    return reply(message, errorEmbed(problem));
-  }
-
-  const targetInfo = {
-    id: target.id,
-    tag: target.user ? target.user.tag : null,
-  };
-
-  return runLimitedAction({
-    message,
-    rank,
-    type: 'ban',
-    target: targetInfo,
-    reason,
-
-    perform: () =>
-      message.guild.members.ban(target.id, {
-        reason: auditReason(message.author.tag, reason),
-        deleteMessageSeconds: 0,
-      }),
-  });
 }
 
+// ==========================================
+// KICK COMMAND
+// ?kick @member reason
+// ==========================================
+
 async function handleKick(message, args, rank) {
-  const target = await resolveTarget(
-    message.guild,
-    args[0]
-  );
+    if (!args[0]) {
+        return message.reply("Usage: `?kick @member [reason]`");
+    }
 
-  if (!target) {
-    return reply(
-      message,
-      errorEmbed(
-        'Usage: `?kick <user mention or ID> [reason]`'
-      )
+    const target = getTargetFromMessage(message, args);
+
+    if (!target) {
+        return message.reply("Member not found in this server.");
+    }
+
+    if (target.id === message.author.id) {
+        return message.reply("You cannot kick yourself.");
+    }
+
+    if (!target.kickable) {
+        return message.reply("I cannot kick this member. Check my role position and permissions.");
+    }
+
+    const reason = getReason(args);
+
+    await runLimitedAction(
+        message,
+        rank,
+        target,
+        "KICK",
+        reason,
+        async () => {
+            await target.kick(reason);
+        }
     );
-  }
+}
 
-  const reason = cleanReason(
-    args.slice(1).join(' ')
-  );
+// ==========================================
+// MUTE COMMAND
+// ?mute @member duration reason
+// ==========================================
 
-  const problem = checkTarget(
-    message.guild,
-    message.member,
-    rank,
-    target,
-    'kick'
-  );
+function parseDuration(input) {
+    if (!input) return null;
 
-  if (problem) {
-    return reply(message, errorEmbed(problem));
-  }
+    const match = input.match(/^(\d+)(s|m|h|d)$/i);
 
-  const targetInfo = {
-    id: target.id,
-    tag: target.user ? target.user.tag : null,
-  };
+    if (!match) return null;
 
-  return runLimitedAction({
-    message,
-    rank,
-    type: 'kick',
-    target: targetInfo,
-    reason,
+    const amount = Number(match[1]);
+    const unit = match[2].toLowerCase();
 
-    perform: () =>
-      target.member.kick(
-        auditReason(message.author.tag, reason)
-      ),
-  });
+    const multipliers = {
+        s: 1000,
+        m: 60 * 1000,
+        h: 60 * 60 * 1000,
+        d: 24 * 60 * 60 * 1000
+    };
+
+    return amount * multipliers[unit];
 }
 
 async function handleMute(message, args, rank) {
-  const target = await resolveTarget(
-    message.guild,
-    args[0]
-  );
+    if (!args[0] || !args[1]) {
+        return message.reply(
+            "Usage: `?mute @member 10m [reason]`"
+        );
+    }
 
-  const duration = parseDuration(args[1]);
+    const target = getTargetFromMessage(message, args);
 
-  if (!target || !duration) {
-    return reply(
-      message,
-      errorEmbed(
-        'Usage: `?mute <user mention or ID> <duration> [reason]`\n' +
-          'Duration examples: `30m`, `2h`, `1d` (maximum 28d).'
-      )
+    if (!target) {
+        return message.reply("Member not found in this server.");
+    }
+
+    if (target.id === message.author.id) {
+        return message.reply("You cannot mute yourself.");
+    }
+
+    if (!target.moderatable) {
+        return message.reply("I cannot timeout this member.");
+    }
+
+    const duration = parseDuration(args[1]);
+
+    if (!duration || duration > 28 * 24 * 60 * 60 * 1000) {
+        return message.reply(
+            "Invalid duration. Use `10m`, `2h`, or `1d` (maximum 28 days)."
+        );
+    }
+
+    const reason = getReason(args, 2);
+
+    await runLimitedAction(
+        message,
+        rank,
+        target,
+        "MUTE",
+        reason,
+        async () => {
+            await target.timeout(duration, reason);
+        }
     );
-  }
-
-  const reason = cleanReason(
-    args.slice(2).join(' ')
-  );
-
-  const problem = checkTarget(
-    message.guild,
-    message.member,
-    rank,
-    target,
-    'mute'
-  );
-
-  if (problem) {
-    return reply(message, errorEmbed(problem));
-  }
-
-  const targetInfo = {
-    id: target.id,
-    tag: target.user ? target.user.tag : null,
-  };
-
-  return runLimitedAction({
-    message,
-    rank,
-    type: 'mute',
-    target: targetInfo,
-    reason,
-
-    perform: () =>
-      target.member.timeout(
-        duration,
-        auditReason(message.author.tag, reason)
-      ),
-  });
 }
+
+// ==========================================
+// WARN COMMAND
+// ?warn @member reason
+// ==========================================
 
 async function handleWarn(message, args, rank) {
-  const target = await resolveTarget(
-    message.guild,
-    args[0]
-  );
-
-  const rawReason = args.slice(1).join(' ').trim();
-
-  if (!target || !rawReason) {
-    return reply(
-      message,
-      errorEmbed(
-        'Usage: `?warn <user mention or ID> <reason>` (a reason is required)'
-      )
-    );
-  }
-
-  const reason = cleanReason(rawReason);
-
-  const problem = checkTarget(
-    message.guild,
-    message.member,
-    rank,
-    target,
-    'warn'
-  );
-
-  if (problem) {
-    return reply(message, errorEmbed(problem));
-  }
-
-  const targetInfo = {
-    id: target.id,
-    tag: target.user ? target.user.tag : null,
-  };
-
-  return runLimitedAction({
-    message,
-    rank,
-    type: 'warn',
-    target: targetInfo,
-    reason,
-
-    perform: async () => {
-      addWarning(
-        target.id,
-        message.author.id,
-        reason
-      );
-
-      // Notify the member. A closed DM never makes the warning fail.
-      await target.user
-        .send({
-          embeds: [
-            infoEmbed(
-              'You have received a warning',
-              `**Server:** ${message.guild.name}\n` +
-                `**Reason:** ${reason}`,
-              0xfee75c
-            ),
-          ],
-        })
-        .catch(() => {});
-    },
-  });
-}
-/* ------------------------------------------------------------------ */
-/* Unban and unmute                                                    */
-/* ------------------------------------------------------------------ */
-
-// Unban and unmute never consume an allowance.
-
-async function handleUnban(message, args) {
-  const id = parseUserId(args[0]);
-
-  if (!id) {
-    return reply(
-      message,
-      errorEmbed('Usage: `?unban <user ID> [reason]`')
-    );
-  }
-
-  const reason = cleanReason(
-    args.slice(1).join(' ')
-  );
-
-  try {
-    await message.guild.bans.remove(
-      id,
-      auditReason(message.author.tag, reason)
-    );
-
-    await reply(
-      message,
-      infoEmbed(
-        'Unban Successful',
-        `User ${id} has been unbanned.`,
-        0x57f287
-      )
-    );
-  } catch (error) {
-    console.error('[unban] Action failed:', error.message);
-
-    await reply(
-      message,
-      errorEmbed(
-        'The user could not be unbanned (is this user actually banned?).'
-      )
-    );
-  }
-}
-
-async function handleUnmute(message, args) {
-  const target = await resolveTarget(
-    message.guild,
-    args[0]
-  );
-
-  if (!target || !target.member) {
-    return reply(
-      message,
-      errorEmbed(
-        'Usage: `?unmute <user mention or ID> [reason]`'
-      )
-    );
-  }
-
-  const reason = cleanReason(
-    args.slice(1).join(' ')
-  );
-
-  try {
-    await target.member.timeout(
-      null,
-      auditReason(message.author.tag, reason)
-    );
-
-    await reply(
-      message,
-      infoEmbed(
-        'Unmute Successful',
-        `${target.user.tag} has been unmuted.`,
-        0x57f287
-      )
-    );
-  } catch (error) {
-    console.error('[unmute] Action failed:', error.message);
-
-    await reply(
-      message,
-      errorEmbed('The user could not be unmuted.')
-    );
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* Moderation limits                                                   */
-/* ------------------------------------------------------------------ */
-
-async function handleLimits(message, args, rank) {
-  let subjectMember = message.member;
-  let subjectRank = rank;
-
-  // Only the Owner rank may inspect another moderator's limits.
-  if (args[0]) {
-    if (rank.key !== 'owner') return null;
-
-    const id = parseUserId(args[0]);
-
-    const member = id
-      ? await message.guild.members.fetch(id).catch(() => null)
-      : null;
-
-    const memberRank = getRank(member);
-
-    if (!member || !memberRank) {
-      return reply(
-        message,
-        errorEmbed(
-          'That user does not hold a configured staff role.'
-        )
-      );
+    if (!args[0]) {
+        return message.reply("Usage: `?warn @member [reason]`");
     }
 
-    subjectMember = member;
-    subjectRank = memberRank;
-  }
+    const target = getTargetFromMessage(message, args);
 
-  const isSelf =
-    subjectMember.id === message.author.id;
+    if (!target) {
+        return message.reply("Member not found in this server.");
+    }
 
-  const title = isSelf
-    ? 'Your Moderation Limits'
-    : `Moderation Limits: ${subjectMember.user.tag}`;
+    if (target.id === message.author.id) {
+        return message.reply("You cannot warn yourself.");
+    }
 
-  if (subjectRank.key === 'owner') {
-    return reply(
-      message,
-      infoEmbed(
-        title,
-        `**${subjectRank.name}**\n\n` +
-          '- Bans: Unlimited\n' +
-          '- Kicks: Unlimited\n' +
-          '- Mutes: Unlimited\n' +
-          '- Warns: Unlimited'
-      )
+    const reason = getReason(args);
+
+    await runLimitedAction(
+        message,
+        rank,
+        target,
+        "WARN",
+        reason,
+        async () => {
+            addWarning(
+                target.id,
+                message.author.id,
+                reason
+            );
+        }
     );
-  }
-
-  const record = getRecord(subjectMember.id);
-
-  const lines = ['ban', 'kick', 'mute', 'warn']
-    .map((type) =>
-      `- ${ACTION_PLURALS[type]}: ${record[type]}/${formatLimit(subjectRank.limits[type])} used`
-    )
-    .join('\n');
-
-  return reply(
-    message,
-    infoEmbed(
-      title,
-      `**${subjectRank.name}**\n\n${lines}\n\n` +
-        `Next reset: <t:${resetTimestamp(record)}:R> ` +
-        `(<t:${resetTimestamp(record)}:F>)`
-    )
-  );
 }
 
-/* ------------------------------------------------------------------ */
-/* Fun command: ?CheckThisFemboy                                      */
-/* ------------------------------------------------------------------ */
-
-const FEMBOY_ITEMS = [
-  'Thigh highs (x7)',
-  'A suspicious number of hoodies',
-  'Programming socks',
-  'A hidden catgirl maid outfit',
-  'Pink keyboard with RGB',
-  'An anime figure collection',
-  'Headphones with cat ears',
-  'Iced matcha latte',
-  'A "totally not for me" skirt',
-  'A playlist full of vocaloid',
-];
-
-const FEMBOY_VERDICTS = [
-  'Certified by the Council of Femboys.',
-  'Scientists are still studying this case.',
-  'The FBI agent in the walls approves.',
-  'Cannot be explained by modern science.',
-  'This result has been verified by 3 Discord kittens.',
-  'The bot got scared and double-checked its math.',
-];
-
-function femboyComment(percent) {
-  if (percent === 100) {
-    return 'PERFECT SCORE. Absolute legend. Bow down.';
-  }
-
-  if (percent >= 90) {
-    return 'Basically a walking femboy meme. No escape.';
-  }
-
-  if (percent >= 70) {
-    return 'Strong femboy energy detected. Skirt incoming.';
-  }
-
-  if (percent >= 50) {
-    return 'Half femboy, half mystery. Dangerous combo.';
-  }
-
-  if (percent >= 30) {
-    return 'A little spark of femboy is growing inside...';
-  }
-
-  if (percent >= 10) {
-    return 'Mostly normal... but the bot has doubts.';
-  }
-
-  return 'Is this person even human?? 0 femboy detected, sir.';
-}
-
-function femboyBar(percent) {
-  const filled = Math.round(
-    Math.min(percent, 100) / 10
-  );
-
-  return (
-    `${'🟪'.repeat(filled)}` +
-    `${'⬛'.repeat(10 - filled)}`
-  );
-}
-
-// Fisher-Yates shuffle.
-function pickRandom(list, count) {
-  const copy = [...list];
-
-  for (let i = copy.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(
-      Math.random() * (i + 1)
-    );
-
-    [copy[i], copy[j]] = [
-      copy[j],
-      copy[i],
-    ];
-  }
-
-  return copy.slice(0, count);
-}
-
-async function handleCheckFemboy(message, args) {
-  const target = await resolveTarget(
-    message.guild,
-    args[0]
-  );
-
-  if (!target || !target.user) {
-    return reply(
-      message,
-      errorEmbed(
-        'Usage: `?CheckThisFemboy <user mention or ID>`'
-      )
-    );
-  }
-
-  const isBot = target.id === client.user.id;
-
-  const percent = isBot
-    ? 1000
-    : Math.floor(Math.random() * 101);
-
-  const comment = isBot
-    ? 'The bot is the ultimate femboy. Off the charts. Do not question it.'
-    : femboyComment(percent);
-
-  const items = pickRandom(FEMBOY_ITEMS, 3);
-  const verdict = pickRandom(FEMBOY_VERDICTS, 1)[0];
-
-  const embed = new EmbedBuilder()
-    .setTitle('Femboy Scanner 3000')
-    .setColor(0xff69b4)
-    .setDescription(
-      `Scan result for **${target.user.tag}**\n\n` +
-        `${femboyBar(percent)}\n` +
-        `**${percent}% femboy**\n\n` +
-        `*${comment}*`
-    )
-    .addFields(
-      {
-        name: 'Evidence found',
-        value: items.map((item) => `- ${item}`).join('\n'),
-      },
-      {
-        name: 'Official verdict',
-        value: verdict,
-      }
-    )
-    .setFooter({
-      text: 'This scan is 100% scientific. Trust me bro.',
-    })
-    .setTimestamp();
-
-  return reply(message, embed);
-}
-
-/* ------------------------------------------------------------------ */
-/* Help command                                                        */
-/* ------------------------------------------------------------------ */
-
-async function handleHelp(message, rank) {
-  const lines = [
-    '`?ban <@user or ID> [reason]` - Ban a user',
-    '`?kick <@user or ID> [reason]` - Kick a member',
-    '`?mute <@user or ID> <duration> [reason]` - Mute a member',
-    '`?warn <@user or ID> <reason>` - Warn a member',
-    '`?unban <user ID> [reason]` - Unban a user',
-    '`?unmute <@user or ID> [reason]` - Remove a mute',
-    '`?limits` - Show your moderation limits',
-  ];
-
-  if (rank) {
-    lines.push(
-      '`?CheckThisFemboy <@user or ID>` - Check how much of a femboy someone is'
-    );
-  }
-
-  if (rank && rank.key === 'owner') {
-    lines.push(
-      "`?limits <@user or ID>` - Show another staff member's limits"
-    );
-  }
-
-  lines.push('`?help` - Show this message');
-
-  const rankLabel = rank
-    ? rank.name
-    : 'Staff (no moderation rank)';
-
-  const note = rank
-    ? 'Mute durations: `30m`, `2h`, `1d` (maximum 28d).'
-    : 'Your staff role does not grant access to the moderation commands above.';
-
-  return reply(
-    message,
-    infoEmbed(
-      'Moderation Commands',
-      `**Your rank:** ${rankLabel}\n\n` +
-        `${lines.join('\n')}\n\n${note}`
-    )
-  );
-}
 // ==========================================
-// PARTIE 4 — COMMAND SYSTEM & BOT STARTUP
+// UNBAN COMMAND
+// ?unban USER_ID reason
 // ==========================================
 
-client.on(Events.MessageCreate, async (message) => {
+async function handleUnban(message, args, rank) {
+    if (!args[0]) {
+        return message.reply("Usage: `?unban USER_ID [reason]`");
+    }
+
+    const userId = getUserId(args[0]);
+
+    if (!userId) {
+        return message.reply("Please provide a valid user ID.");
+    }
+
+    const reason = getReason(args);
+
     try {
-        if (message.author.bot || !message.guild) return;
+        await message.guild.members.unban(userId, reason);
 
-        // Only handle prefix commands
-        if (!message.content.startsWith(PREFIX)) return;
-
-        const member = message.member;
-        if (!member) return;
-
-        // Check member role
-        // Members without a staff rank receive the humorous response.
-        const rank = getRank(member);
-
-        if (
-            MEMBER_ROLE_ID &&
-            member.roles.cache.has(MEMBER_ROLE_ID) &&
-            !rank
-        ) {
-            await message.reply(PEASANT_MESSAGE);
-            return;
-        }
-
-        const args = message.content
-            .slice(PREFIX.length)
-            .trim()
-            .split(/\s+/);
-
-        const command = (args.shift() || '').toLowerCase();
-
-        if (!command) return;
-
-        // ======================================
-        // HELP
-        // ======================================
-
-        if (command === 'help') {
-            if (!rank && !hasExtraStaffRole(member)) {
-                return message.reply('You are not authorized to use this command.');
-            }
-
-            return handleHelp(message);
-        }
-
-        // ======================================
-        // FUN COMMAND
-        // ======================================
-
-        if (command === 'checkthisfemboy') {
-            if (!rank && !hasExtraStaffRole(member)) {
-                return message.reply('You are not authorized to use this command.');
-            }
-
-            return handleCheckThisFemboy(message);
-        }
-
-        // ======================================
-        // MODERATION COMMANDS
-        // ======================================
-
-        if (!rank) {
-            return message.reply('You do not have permission to use moderation commands.');
-        }
-
-        switch (command) {
-            case 'ban':
-                return handleBan(message, args, rank);
-
-            case 'kick':
-                return handleKick(message, args, rank);
-
-            case 'mute':
-                return handleMute(message, args, rank);
-
-            case 'warn':
-                return handleWarn(message, args, rank);
-
-            case 'unban':
-                return handleUnban(message, args, rank);
-
-            case 'unmute':
-                return handleUnmute(message, args, rank);
-
-            case 'limits':
-                return handleLimits(message, args, rank);
-
-            default:
-                return;
-        }
+        await message.reply({
+            embeds: [
+                createEmbed(
+                    "Member Unbanned",
+                    `**User ID:** ${userId}\n` +
+                    `**Moderator:** ${message.author.tag}\n` +
+                    `**Reason:** ${reason}`,
+                    0x57F287
+                )
+            ]
+        });
 
     } catch (error) {
-        console.error('[MESSAGE ERROR]', error);
+        console.error("Unban error:", error);
+        await message.reply("Could not unban this user. They may not be banned.");
+    }
+}
 
-        try {
-            await message.reply('An unexpected error occurred while executing this command.');
-        } catch (_) {}
+// ==========================================
+// UNMUTE COMMAND
+// ?unmute @member
+// ==========================================
+
+async function handleUnmute(message, args, rank) {
+    if (!args[0]) {
+        return message.reply("Usage: `?unmute @member`");
+    }
+
+    const target = getTargetFromMessage(message, args);
+
+    if (!target) {
+        return message.reply("Member not found in this server.");
+    }
+
+    if (!target.moderatable) {
+        return message.reply("I cannot remove this member's timeout.");
+    }
+
+    try {
+        await target.timeout(null, `Unmuted by ${message.author.tag}`);
+
+        await message.reply({
+            embeds: [
+                createEmbed(
+                    "Member Unmuted",
+                    `**Member:** ${target.user.tag}\n` +
+                    `**Moderator:** ${message.author.tag}`,
+                    0x57F287
+                )
+            ]
+        });
+
+    } catch (error) {
+        console.error("Unmute error:", error);
+        await message.reply("Could not unmute this member.");
+    }
+}
+
+// ==========================================
+// MANAGEMEMBER COMMAND
+// ?managemember @member
+// ==========================================
+
+async function handleManageMember(message, args) {
+    if (!args[0]) {
+        return message.reply("Usage: `?managemember @member`");
+    }
+
+    const userId = getUserId(args[0]);
+
+    if (!userId) {
+        return message.reply("Please provide a valid member mention or ID.");
+    }
+
+    const history = sanctionsData[userId] || [];
+
+    const counts = {
+        BAN: 0,
+        KICK: 0,
+        WARN: 0,
+        MUTE: 0
+    };
+
+    for (const sanction of history) {
+        if (counts[sanction.type] !== undefined) {
+            counts[sanction.type]++;
+        }
+    }
+
+    let username = `User ID: ${userId}`;
+
+    try {
+        const user = await client.users.fetch(userId);
+        username = `${user.tag} (${user.id})`;
+    } catch {}
+
+    const embed = createEmbed(
+        "Member Management",
+        `**Member:** ${username}\n\n` +
+        `**Moderation statistics**\n` +
+        `Bans: ${counts.BAN}\n` +
+        `Kicks: ${counts.KICK}\n` +
+        `Warnings: ${counts.WARN}\n` +
+        `Mutes: ${counts.MUTE}\n\n` +
+        `**Total sanctions:** ${history.length}`,
+        0x3498DB
+    );
+
+    await message.reply({ embeds: [embed] });
+}
+
+// ==========================================
+// WARNINGS COMMAND
+// ?warnings @member
+// ==========================================
+
+async function handleWarnings(message, args) {
+    if (!args[0]) {
+        return message.reply("Usage: `?warnings @member`");
+    }
+
+    const userId = getUserId(args[0]);
+
+    if (!userId) {
+        return message.reply("Please provide a valid member mention or ID.");
+    }
+
+    const warnings = warningsData[userId] || [];
+
+    if (warnings.length === 0) {
+        return message.reply("This member has no active warnings.");
+    }
+
+    const displayedWarnings = warnings.slice(-15).reverse();
+
+    const description = displayedWarnings.map((warning, index) => {
+        return (
+            `**${index + 1}.** ${warning.reason}\n` +
+            `Moderator: <@${warning.moderatorId}>\n` +
+            `Date: ${formatDate(warning.timestamp)}`
+        );
+    }).join("\n\n");
+
+    const embed = createEmbed(
+        `Warnings — ${userId}`,
+        `**Active warnings:** ${warnings.length}\n\n${description}`,
+        0xF1C40F
+    );
+
+    await message.reply({ embeds: [embed] });
+}
+
+// ==========================================
+// HISTORY COMMAND
+// ?history @member
+// ==========================================
+
+async function handleHistory(message, args) {
+    if (!args[0]) {
+        return message.reply("Usage: `?history @member`");
+    }
+
+    const userId = getUserId(args[0]);
+
+    if (!userId) {
+        return message.reply("Please provide a valid member mention or ID.");
+    }
+
+    const history = sanctionsData[userId] || [];
+
+    if (history.length === 0) {
+        return message.reply("No moderation history found for this member.");
+    }
+
+    const displayedHistory = history.slice(-15).reverse();
+
+    const description = displayedHistory.map((entry, index) => {
+        return (
+            `**${index + 1}. ${entry.type}**\n` +
+            `Moderator: <@${entry.moderatorId}>\n` +
+            `Reason: ${entry.reason}\n` +
+            `Date: ${formatDate(entry.timestamp)}`
+        );
+    }).join("\n\n");
+
+    const embed = createEmbed(
+        `Moderation History — ${userId}`,
+        `**Total recorded sanctions:** ${history.length}\n\n${description}`,
+        0x5865F2
+    );
+
+    await message.reply({ embeds: [embed] });
+}
+
+// ==========================================
+// CLEARWARNS COMMAND
+// ?clearwarns @member [reason]
+// Supervisor and Owner only
+// ==========================================
+
+async function handleClearWarns(message, args, rank) {
+    if (!hasPermission(rank, "SUPERVISOR")) {
+        return message.reply(
+            "Only Supervisors and Owners can clear warnings."
+        );
+    }
+
+    if (!args[0]) {
+        return message.reply(
+            "Usage: `?clearwarns @member [reason]`"
+        );
+    }
+
+    const userId = getUserId(args[0]);
+
+    if (!userId) {
+        return message.reply("Please provide a valid member mention or ID.");
+    }
+
+    const warnings = warningsData[userId] || [];
+
+    if (warnings.length === 0) {
+        return message.reply("This member has no active warnings.");
+    }
+
+    const previousCount = warnings.length;
+    const reason = getReason(args);
+
+    warningsData[userId] = [];
+
+    saveJSON(WARNINGS_FILE, warningsData);
+
+    const embed = createEmbed(
+        "Warnings Cleared",
+        `**Member:** <@${userId}>\n` +
+        `**Warnings removed:** ${previousCount}\n` +
+        `**Moderator:** ${message.author.tag}\n` +
+        `**Reason:** ${reason}\n\n` +
+        "The permanent moderation history has been preserved.",
+        0x57F287
+    );
+
+    await message.reply({ embeds: [embed] });
+}
+
+// ==========================================
+// STAFFSTATS COMMAND
+// ?staffstats [@staff]
+// ==========================================
+
+async function handleStaffStats(message, args, rank) {
+    const requestedId = args[0]
+        ? getUserId(args[0])
+        : message.author.id;
+
+    if (!requestedId) {
+        return message.reply("Please provide a valid user mention or ID.");
+    }
+
+    if (
+        requestedId !== message.author.id &&
+        !hasPermission(rank, "OWNER")
+    ) {
+        return message.reply(
+            "Only the Owner can view another staff member's statistics."
+        );
+    }
+
+    const usage = getStaffUsage(requestedId);
+
+    let staffName = requestedId;
+
+    try {
+        const user = await client.users.fetch(requestedId);
+        staffName = user.tag;
+    } catch {}
+
+    const staffMember = message.guild.members.cache.get(requestedId);
+    const staffRank = staffMember
+        ? getStaffRank(staffMember)
+        : "Unknown";
+
+    const limit = staffRank === "OWNER"
+        ? "Unlimited"
+        : ACTION_LIMITS[staffRank] ?? "Unknown";
+
+    const remaining = staffRank === "OWNER"
+        ? "Unlimited"
+        : Math.max(0, limit - usage.count);
+
+    const embed = createEmbed(
+        "Staff Statistics",
+        `**Staff:** ${staffName}\n` +
+        `**Rank:** ${staffRank}\n\n` +
+        `**Actions used:** ${usage.count}\n` +
+        `**Action limit:** ${limit}\n` +
+        `**Remaining actions:** ${remaining}\n\n` +
+        `**Reset:** ${formatDate(usage.resetAt)}`,
+        0x3498DB
+    );
+
+    await message.reply({ embeds: [embed] });
+}
+
+// ==========================================
+// HELP COMMAND
+// ?help
+// ==========================================
+
+async function handleHelp(message, rank) {
+    const commands = [
+        "**GENERAL COMMANDS**",
+        "`?help` — Display all commands",
+        "",
+        "**MODERATION COMMANDS**",
+        "`?ban @member [reason]` — Ban a member",
+        "`?kick @member [reason]` — Kick a member",
+        "`?mute @member 10m [reason]` — Timeout a member",
+        "`?warn @member [reason]` — Warn a member",
+        "`?unban USER_ID [reason]` — Unban a user",
+        "`?unmute @member` — Remove a timeout",
+        "",
+        "**MEMBER MANAGEMENT**",
+        "`?managemember @member` — View moderation statistics",
+        "`?warnings @member` — View active warnings",
+        "`?history @member` — View moderation history",
+        "`?clearwarns @member [reason]` — Clear active warnings",
+        "",
+        "**STAFF COMMANDS**",
+        "`?staffstats [@staff]` — View staff action statistics"
+    ];
+
+    const embed = createEmbed(
+        "Moderation Bot — Commands",
+        commands.join("\n"),
+        0x5865F2
+    );
+
+    embed.addFields({
+        name: "Your staff rank",
+        value: rank || "No staff rank",
+        inline: true
+    });
+
+    await message.reply({ embeds: [embed] });
+}
+
+// ==========================================
+// FUN COMMAND
+// ?CheckThisFemboy
+// ==========================================
+
+async function handleCheckFemboy(message, args) {
+    const target = args[0]
+        ? getUserId(args[0])
+        : message.author.id;
+
+    if (!target) {
+        return message.reply("Please provide a valid user mention or ID.");
+    }
+
+    await message.reply(
+        `Member checked: <@${target}>`
+    );
+}
+
+// ==========================================
+// COMMAND REGISTRY
+// ==========================================
+
+const KNOWN_COMMANDS = [
+    "help",
+    "ban",
+    "kick",
+    "mute",
+    "warn",
+    "unban",
+    "unmute",
+    "managemember",
+    "warnings",
+    "history",
+    "clearwarns",
+    "staffstats",
+    "checkthisfemboy"
+];
+
+// ==========================================
+// MESSAGE COMMAND HANDLER
+// ==========================================
+
+client.on("messageCreate", async (message) => {
+    if (message.author.bot) return;
+    if (!message.guild) return;
+    if (!message.content.startsWith(PREFIX)) return;
+
+    const args = message.content
+        .slice(PREFIX.length)
+        .trim()
+        .split(/\s+/);
+
+    const command = args.shift()?.toLowerCase();
+
+    if (!command) return;
+
+    if (!KNOWN_COMMANDS.includes(command)) return;
+
+    const rank = getStaffRank(message.member);
+
+    // Commands available to everyone
+    if (command === "help") {
+        return handleHelp(message, rank);
+    }
+
+    if (command === "checkthisfemboy") {
+        return handleCheckFemboy(message, args);
+    }
+
+    // All remaining commands require staff
+    if (!rank) {
+        return message.reply(
+            "You do not have permission to use moderation commands."
+        );
+    }
+
+    try {
+        switch (command) {
+            case "ban":
+                if (!hasPermission(rank, "TRIAL_MODERATOR")) break;
+                return handleBan(message, args, rank);
+
+            case "kick":
+                if (!hasPermission(rank, "TRIAL_MODERATOR")) break;
+                return handleKick(message, args, rank);
+
+            case "mute":
+                if (!hasPermission(rank, "TRIAL_MODERATOR")) break;
+                return handleMute(message, args, rank);
+
+            case "warn":
+                if (!hasPermission(rank, "TRIAL_MODERATOR")) break;
+                return handleWarn(message, args, rank);
+
+            case "unban":
+                if (!hasPermission(rank, "MODERATOR")) break;
+                return handleUnban(message, args, rank);
+
+            case "unmute":
+                if (!hasPermission(rank, "MODERATOR")) break;
+                return handleUnmute(message, args, rank);
+
+            case "managemember":
+                return handleManageMember(message, args);
+
+            case "warnings":
+                return handleWarnings(message, args);
+
+            case "history":
+                return handleHistory(message, args);
+
+            case "clearwarns":
+                return handleClearWarns(message, args, rank);
+
+            case "staffstats":
+                return handleStaffStats(message, args, rank);
+        }
+
+        await message.reply(
+            "You do not have the required staff rank for this command."
+        );
+
+    } catch (error) {
+        console.error(`Command error (${command}):`, error);
+
+        await message.reply(
+            "An unexpected error occurred while executing this command."
+        ).catch(() => {});
     }
 });
 
-
 // ==========================================
-// BOT READY
+// BOT READY EVENT
 // ==========================================
 
-client.once(Events.ClientReady, (readyClient) => {
-    console.log('================================');
-    console.log(`Bot online: ${readyClient.user.tag}`);
+client.once("ready", () => {
+    console.log("================================");
+    console.log(`Logged in as ${client.user.tag}`);
+    console.log(`Bot ID: ${client.user.id}`);
     console.log(`Prefix: ${PREFIX}`);
-    console.log('Message logging: DISABLED');
-    console.log('Moderation system: ACTIVE');
-    console.log('================================');
-});
+    console.log("Moderation system is online.");
+    console.log("================================");
 
+    client.user.setActivity("Moderation System", {
+        type: 0
+    });
+});
 
 // ==========================================
 // RENDER HEALTH CHECK SERVER
 // ==========================================
 
-const PORT = Number(process.env.PORT || 3000);
-
 const server = http.createServer((req, res) => {
-    if (req.url === '/health') {
+    if (req.url === "/") {
         res.writeHead(200, {
-            'Content-Type': 'application/json'
+            "Content-Type": "text/plain"
+        });
+
+        return res.end("Moderation Bot is online.");
+    }
+
+    if (req.url === "/health") {
+        res.writeHead(200, {
+            "Content-Type": "application/json"
         });
 
         return res.end(JSON.stringify({
-            status: 'online',
-            bot: client.isReady()
+            status: "online",
+            bot: client.isReady(),
+            uptime: process.uptime()
         }));
     }
 
-    res.writeHead(200, {
-        'Content-Type': 'text/plain'
-    });
-
-    res.end('Moderation bot is running.');
+    res.writeHead(404);
+    res.end("Not found");
 });
 
 server.listen(PORT, () => {
-    console.log(`HTTP server listening on port ${PORT}`);
+    console.log(`Health server running on port ${PORT}`);
 });
-
-
-// ==========================================
-// ERROR HANDLING
-// ==========================================
-
-process.on('unhandledRejection', (error) => {
-    console.error('[UNHANDLED REJECTION]', error);
-});
-
-process.on('uncaughtException', (error) => {
-    console.error('[UNCAUGHT EXCEPTION]', error);
-});
-
 
 // ==========================================
 // GRACEFUL SHUTDOWN
@@ -1332,44 +1107,33 @@ process.on('uncaughtException', (error) => {
 async function shutdown(signal) {
     console.log(`${signal} received. Shutting down...`);
 
+    saveAllData();
+
+    server.close();
+
     try {
-        saveStore();
-        saveWarnings();
-
-        server.close();
-
         client.destroy();
-
-        console.log('Bot shutdown complete.');
-        process.exit(0);
-
     } catch (error) {
-        console.error('Shutdown error:', error);
-        process.exit(1);
+        console.error("Error destroying Discord client:", error);
     }
+
+    process.exit(0);
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 // ==========================================
 // START BOT
 // ==========================================
 
 async function startBot() {
+    loadAllData();
+
     try {
-        if (!process.env.DISCORD_TOKEN) {
-            throw new Error('DISCORD_TOKEN is missing from environment variables.');
-        }
-
-        loadStore();
-        loadWarnings();
-
-        await client.login(process.env.DISCORD_TOKEN);
-
+        await client.login(TOKEN);
     } catch (error) {
-        console.error('[STARTUP ERROR]', error);
+        console.error("Failed to login to Discord:", error);
         process.exit(1);
     }
 }
