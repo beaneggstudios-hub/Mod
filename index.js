@@ -1,4 +1,3 @@
-
 const {
     Client,
     GatewayIntentBits,
@@ -369,27 +368,58 @@ async function checkStaff(message, minimumRank = "TRIAL_MODERATOR") {
 }
 
 // ==========================================
-// BAN COMMAND
-// ?ban @member reason
+// BAN COMMAND (par ID, même hors du serveur)
+// ?ban @member|USER_ID reason
+// ?ipban @member|USER_ID reason  (alias)
 // ==========================================
 
 async function handleBan(message, args, rank) {
     if (!args[0]) {
-        return message.reply("Usage: `?ban @member [reason]`");
+        return message.reply("Usage: `?ban @member|USER_ID [reason]`");
     }
 
-    const target = getTargetFromMessage(message, args);
+    const targetId = getUserId(args[0]);
 
-    if (!target) {
-        return message.reply("Member not found in this server.");
+    if (!targetId) {
+        return message.reply("Please provide a valid mention or user ID.");
     }
 
-    if (target.id === message.author.id) {
+    if (targetId === message.author.id) {
         return message.reply("You cannot ban yourself.");
     }
 
-    if (!target.bannable) {
-        return message.reply("I cannot ban this member. Check my role position and permissions.");
+    if (targetId === client.user.id) {
+        return message.reply("I cannot ban myself.");
+    }
+
+    // Déjà banni ?
+    const existingBan = await message.guild.bans.fetch(targetId).catch(() => null);
+
+    if (existingBan) {
+        return message.reply("This user is already banned.");
+    }
+
+    // Membre présent dans le serveur ? (sinon null, on bannit quand même par ID)
+    const member = await message.guild.members.fetch(targetId).catch(() => null);
+
+    if (member) {
+        if (!member.bannable) {
+            return message.reply("I cannot ban this member. Check my role position and permissions.");
+        }
+
+        if (
+            rank !== "OWNER" &&
+            message.member.roles.highest.position <= member.roles.highest.position
+        ) {
+            return message.reply("You cannot ban a member with an equal or higher role than yours.");
+        }
+    }
+
+    // Récupère l'utilisateur Discord (même s'il n'est pas dans le serveur)
+    const user = await client.users.fetch(targetId).catch(() => null);
+
+    if (!user) {
+        return message.reply("This user ID does not exist on Discord.");
     }
 
     const reason = getReason(args);
@@ -397,11 +427,11 @@ async function handleBan(message, args, rank) {
     await runLimitedAction(
         message,
         rank,
-        target,
+        user,
         "BAN",
         reason,
         async () => {
-            await target.ban({ reason });
+            await message.guild.members.ban(targetId, { reason });
         }
     );
 }
@@ -859,7 +889,9 @@ async function handleStaffStats(message, args, rank) {
 
     const remaining = staffRank === "OWNER"
         ? "Unlimited"
-        : Math.max(0, limit - usage.count);
+        : typeof limit === "number"
+            ? Math.max(0, limit - usage.count)
+            : "Unknown";
 
     const embed = createEmbed(
         "Staff Statistics",
@@ -886,7 +918,8 @@ async function handleHelp(message, rank) {
         "`?help` — Display all commands",
         "",
         "**MODERATION COMMANDS**",
-        "`?ban @member [reason]` — Ban a member",
+        "`?ban @member|USER_ID [reason]` — Ban a member (even if not in the server)",
+        "`?ipban @member|USER_ID [reason]` — Alias of ?ban",
         "`?kick @member [reason]` — Kick a member",
         "`?mute @member 10m [reason]` — Timeout a member",
         "`?warn @member [reason]` — Warn a member",
@@ -944,6 +977,7 @@ async function handleCheckFemboy(message, args) {
 const KNOWN_COMMANDS = [
     "help",
     "ban",
+    "ipban",
     "kick",
     "mute",
     "warn",
@@ -998,43 +1032,44 @@ client.on("messageCreate", async (message) => {
     try {
         switch (command) {
             case "ban":
+            case "ipban":
                 if (!hasPermission(rank, "TRIAL_MODERATOR")) break;
-                return handleBan(message, args, rank);
+                return await handleBan(message, args, rank);
 
             case "kick":
                 if (!hasPermission(rank, "TRIAL_MODERATOR")) break;
-                return handleKick(message, args, rank);
+                return await handleKick(message, args, rank);
 
             case "mute":
                 if (!hasPermission(rank, "TRIAL_MODERATOR")) break;
-                return handleMute(message, args, rank);
+                return await handleMute(message, args, rank);
 
             case "warn":
                 if (!hasPermission(rank, "TRIAL_MODERATOR")) break;
-                return handleWarn(message, args, rank);
+                return await handleWarn(message, args, rank);
 
             case "unban":
                 if (!hasPermission(rank, "MODERATOR")) break;
-                return handleUnban(message, args, rank);
+                return await handleUnban(message, args, rank);
 
             case "unmute":
                 if (!hasPermission(rank, "MODERATOR")) break;
-                return handleUnmute(message, args, rank);
+                return await handleUnmute(message, args, rank);
 
             case "managemember":
-                return handleManageMember(message, args);
+                return await handleManageMember(message, args);
 
             case "warnings":
-                return handleWarnings(message, args);
+                return await handleWarnings(message, args);
 
             case "history":
-                return handleHistory(message, args);
+                return await handleHistory(message, args);
 
             case "clearwarns":
-                return handleClearWarns(message, args, rank);
+                return await handleClearWarns(message, args, rank);
 
             case "staffstats":
-                return handleStaffStats(message, args, rank);
+                return await handleStaffStats(message, args, rank);
         }
 
         await message.reply(
