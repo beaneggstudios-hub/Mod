@@ -1,8 +1,7 @@
 const {
     Client,
     GatewayIntentBits,
-    EmbedBuilder,
-    PermissionsBitField
+    EmbedBuilder
 } = require("discord.js");
 
 const fs = require("fs");
@@ -12,7 +11,7 @@ const http = require("http");
 require("dotenv").config();
 
 // ==========================================
-// CONFIGURATION PRINCIPALE
+// MAIN CONFIGURATION
 // ==========================================
 
 const PREFIX = "?";
@@ -77,6 +76,7 @@ if (!fs.existsSync(DATA_FOLDER)) {
 const LIMITS_FILE = path.join(DATA_FOLDER, "limits.json");
 const WARNINGS_FILE = path.join(DATA_FOLDER, "warnings.json");
 const SANCTIONS_FILE = path.join(DATA_FOLDER, "sanctions.json");
+const DEPARTED_FILE = path.join(DATA_FOLDER, "departed.json");
 
 function loadJSON(file, defaultValue = {}) {
     try {
@@ -113,11 +113,13 @@ function saveJSON(file, data) {
 let limitsData = {};
 let warningsData = {};
 let sanctionsData = {};
+let departedData = {};
 
 function loadAllData() {
     limitsData = loadJSON(LIMITS_FILE, {});
     warningsData = loadJSON(WARNINGS_FILE, {});
     sanctionsData = loadJSON(SANCTIONS_FILE, {});
+    departedData = loadJSON(DEPARTED_FILE, {});
 
     console.log("All moderation databases loaded.");
 }
@@ -126,6 +128,7 @@ function saveAllData() {
     saveJSON(LIMITS_FILE, limitsData);
     saveJSON(WARNINGS_FILE, warningsData);
     saveJSON(SANCTIONS_FILE, sanctionsData);
+    saveJSON(DEPARTED_FILE, departedData);
 }
 
 // ==========================================
@@ -369,21 +372,14 @@ async function checkStaff(message, minimumRank = "TRIAL_MODERATOR") {
 }
 
 // ==========================================
-// ANALYST SYSTEM - détection d'alts / ban evasion
+// ANALYST SYSTEM - ALT ACCOUNT DETECTION
 // ?analyst all
 // ==========================================
 
-const ANALYST_ALERT_THRESHOLD = 50;                         // score minimum pour une alerte
-const ANALYST_DEPARTED_RETENTION = 90 * 24 * 60 * 60 * 1000; // départs gardés 90 jours
-const ANALYST_REJOIN_WINDOW = 7 * 24 * 60 * 60 * 1000;       // revenu sous 7 jours = suspect
-const ANALYST_NEW_ACCOUNT_AGE = 14 * 24 * 60 * 60 * 1000;    // compte < 14 jours = bonus
-
-const DEPARTED_FILE = path.join(DATA_FOLDER, "departed.json");
-let departedData = {};
-
-function saveDeparted() {
-    saveJSON(DEPARTED_FILE, departedData);
-}
+const ANALYST_ALERT_THRESHOLD = 50;                          // Minimum score to raise an alert
+const ANALYST_DEPARTED_RETENTION = 90 * 24 * 60 * 60 * 1000; // Departed members are kept for 90 days
+const ANALYST_REJOIN_WINDOW = 7 * 24 * 60 * 60 * 1000;       // Rejoin within 7 days is suspicious
+const ANALYST_NEW_ACCOUNT_AGE = 14 * 24 * 60 * 60 * 1000;    // Accounts younger than 14 days
 
 function pruneDeparted() {
     const limit = Date.now() - ANALYST_DEPARTED_RETENTION;
@@ -400,7 +396,7 @@ function normalizeName(str) {
         .toLowerCase()
         .normalize("NFKD")
         .replace(/[^a-z0-9]/g, "")
-        .replace(/\d+$/, ""); // enlève les chiffres de fin (user123 -> user)
+        .replace(/\d+$/, ""); // Strip trailing digits (user123 -> user)
 }
 
 function levenshtein(a, b) {
@@ -439,14 +435,14 @@ function profileFromUser(user, member) {
     };
 }
 
-// `old` = compte parti / banni / autre membre, `cur` = compte suspect
+// `old` = previous account (left / banned / other member), `cur` = account under review
 function scorePair(old, cur) {
     let score = 0;
     const reasons = [];
 
     if (old.avatar && old.avatar === cur.avatar) {
         score += 40;
-        reasons.push("Même avatar personnalisé");
+        reasons.push("Identical custom avatar");
     }
 
     const a = normalizeName(old.username);
@@ -455,13 +451,13 @@ function scorePair(old, cur) {
     if (a.length >= 3 && b.length >= 3) {
         if (a === b) {
             score += 40;
-            reasons.push("Pseudo identique (hors chiffres/symboles)");
+            reasons.push("Identical username (ignoring digits and symbols)");
         } else {
             const sim = nameSimilarity(a, b);
 
             if (sim >= 0.8) {
                 score += 30;
-                reasons.push(`Pseudo très similaire (${Math.round(sim * 100)}%)`);
+                reasons.push(`Highly similar username (${Math.round(sim * 100)}%)`);
             }
         }
     }
@@ -471,7 +467,7 @@ function scorePair(old, cur) {
 
     if (da.length >= 3 && da === db && old.displayName !== old.username) {
         score += 15;
-        reasons.push("Même nom d'affichage");
+        reasons.push("Identical display name");
     }
 
     if (score > 0) {
@@ -482,12 +478,12 @@ function scorePair(old, cur) {
             cur.joinedAt - old.leftAt <= ANALYST_REJOIN_WINDOW
         ) {
             score += 15;
-            reasons.push("Rejoint peu après le départ de l'ancien compte");
+            reasons.push("Joined shortly after the previous account left");
         }
 
         if (Date.now() - cur.createdAt < ANALYST_NEW_ACCOUNT_AGE) {
             score += 10;
-            reasons.push("Compte Discord récent");
+            reasons.push("Recently created Discord account");
         }
     }
 
@@ -557,11 +553,11 @@ function chunkFindings(findings, size) {
 function buildAnalystEmbed(title, findings) {
     const description = findings.map(({ cur, hits }) => {
         const top = hits.slice(0, 3).map(h =>
-            `• **${h.old.source || "MEMBRE"}** ${h.old.tag} (\`${h.old.id}\`) — score **${h.score}**\n` +
-            `  ${h.reasons.join(", ")}`
+            `- **${h.old.source || "MEMBER"}:** ${h.old.tag} (\`${h.old.id}\`) | Score: **${h.score}**\n` +
+            `  ${h.reasons.join("; ")}`
         ).join("\n");
 
-        return `⚠️ <@${cur.id}> (${cur.tag})\n${top}`;
+        return `**Flagged account:** <@${cur.id}> (${cur.tag})\n${top}`;
     }).join("\n\n");
 
     return new EmbedBuilder()
@@ -584,7 +580,7 @@ async function sendAnalystAlert(guild, findings, title) {
     return true;
 }
 
-// Enregistre les membres qui quittent le serveur
+// Record members who leave the server
 client.on("guildMemberRemove", (member) => {
     if (!member.user) return;
 
@@ -594,10 +590,10 @@ client.on("guildMemberRemove", (member) => {
     };
 
     pruneDeparted();
-    saveDeparted();
+    saveJSON(DEPARTED_FILE, departedData);
 });
 
-// Alerte automatique quand quelqu'un rejoint
+// Automatic alert when a new member joins
 client.on("guildMemberAdd", async (member) => {
     try {
         if (member.user.bot) return;
@@ -605,13 +601,13 @@ client.on("guildMemberAdd", async (member) => {
         const cur = profileFromUser(member.user, member);
         const banned = await member.guild.bans.fetch().catch(() => null);
 
-        const pool = Object.values(departedData).map(d => ({ ...d, source: "A QUITTÉ" }));
+        const pool = Object.values(departedData).map(d => ({ ...d, source: "LEFT SERVER" }));
 
         if (banned) {
             for (const ban of banned.values()) {
                 pool.push({
                     ...profileFromUser(ban.user),
-                    source: "BANNI",
+                    source: "BANNED",
                     leftAt: null
                 });
             }
@@ -629,7 +625,7 @@ client.on("guildMemberAdd", async (member) => {
         await sendAnalystAlert(
             member.guild,
             [{ cur, hits }],
-            "Alerte : possible alt à l'arrivée"
+            "Alt Account Alert - New Member"
         );
     } catch (error) {
         console.error("Analyst join check error:", error);
@@ -641,7 +637,7 @@ async function handleAnalyst(message, args) {
         return message.reply("Usage: `?analyst all`");
     }
 
-    const status = await message.reply("🔍 Analyse en cours, cela peut prendre un moment...");
+    const status = await message.reply("Analysis in progress. This may take a moment.");
 
     const guild = message.guild;
     const members = await guild.members.fetch();
@@ -651,18 +647,18 @@ async function handleAnalyst(message, args) {
         .filter(m => !m.user.bot)
         .map(m => profileFromUser(m.user, m));
 
-    const departedPool = Object.values(departedData).map(d => ({ ...d, source: "A QUITTÉ" }));
+    const departedPool = Object.values(departedData).map(d => ({ ...d, source: "LEFT SERVER" }));
 
     const bannedPool = banned
         ? [...banned.values()].map(b => ({
             ...profileFromUser(b.user),
-            source: "BANNI",
+            source: "BANNED",
             leftAt: null
         }))
         : [];
 
     const pastIndex = buildIndex([...departedPool, ...bannedPool]);
-    const currentIndex = buildIndex(current.map(c => ({ ...c, source: "MEMBRE ACTUEL" })));
+    const currentIndex = buildIndex(current.map(c => ({ ...c, source: "CURRENT MEMBER" })));
 
     const findings = [];
     const seenPairs = new Set();
@@ -670,7 +666,7 @@ async function handleAnalyst(message, args) {
     for (const cur of current) {
         const hits = [];
 
-        // Comparaison avec les anciens comptes (partis / bannis)
+        // Compare against previous accounts (left / banned)
         for (const old of candidatesFor(pastIndex, cur)) {
             const result = scorePair(old, cur);
 
@@ -679,7 +675,7 @@ async function handleAnalyst(message, args) {
             }
         }
 
-        // Comparaison entre membres actuels (seuil plus strict)
+        // Compare against other current members (stricter threshold)
         for (const other of candidatesFor(currentIndex, cur)) {
             const key = [cur.id, other.id].sort().join("-");
 
@@ -689,7 +685,7 @@ async function handleAnalyst(message, args) {
             const result = scorePair(other, cur);
 
             if (result.score >= ANALYST_ALERT_THRESHOLD + 10) {
-                hits.push({ old: { ...other, source: "MEMBRE ACTUEL" }, ...result });
+                hits.push({ old: { ...other, source: "CURRENT MEMBER" }, ...result });
             }
         }
 
@@ -702,10 +698,10 @@ async function handleAnalyst(message, args) {
     findings.sort((a, b) => b.hits[0].score - a.hits[0].score);
 
     const summary =
-        `✅ Analyse terminée.\n` +
-        `**Membres analysés :** ${current.length}\n` +
-        `**Anciens comptes comparés :** ${departedPool.length + bannedPool.length}\n` +
-        `**Comptes suspects :** ${findings.length}`;
+        `**Analysis complete.**\n` +
+        `Members analyzed: ${current.length}\n` +
+        `Previous accounts compared: ${departedPool.length + bannedPool.length}\n` +
+        `Suspicious accounts found: ${findings.length}`;
 
     await status.edit(summary).catch(() => message.reply(summary));
 
@@ -714,22 +710,22 @@ async function handleAnalyst(message, args) {
     const sentToChannel = await sendAnalystAlert(
         guild,
         findings.slice(0, 25),
-        "Rapport d'analyse : alts suspects"
+        "Analysis Report - Suspected Alt Accounts"
     );
 
     if (!sentToChannel) {
         for (const chunk of chunkFindings(findings.slice(0, 15), 5)) {
             await message.channel.send({
-                embeds: [buildAnalystEmbed("Rapport d'analyse : alts suspects", chunk)]
+                embeds: [buildAnalystEmbed("Analysis Report - Suspected Alt Accounts", chunk)]
             });
         }
     } else {
-        await message.channel.send("📨 Le rapport détaillé a été envoyé dans le salon d'alertes.");
+        await message.channel.send("The detailed report has been sent to the alert channel.");
     }
 }
 
 // ==========================================
-// BAN COMMAND (par ID, même hors du serveur)
+// BAN COMMAND (by ID, even if not in the server)
 // ?ban @member|USER_ID reason
 // ?ipban @member|USER_ID reason  (alias)
 // ==========================================
@@ -753,14 +749,14 @@ async function handleBan(message, args, rank) {
         return message.reply("I cannot ban myself.");
     }
 
-    // Déjà banni ?
+    // Already banned?
     const existingBan = await message.guild.bans.fetch(targetId).catch(() => null);
 
     if (existingBan) {
         return message.reply("This user is already banned.");
     }
 
-    // Membre présent dans le serveur ? (sinon null, on bannit quand même par ID)
+    // Is the member in the server? (if not, ban by ID anyway)
     const member = await message.guild.members.fetch(targetId).catch(() => null);
 
     if (member) {
@@ -776,7 +772,7 @@ async function handleBan(message, args, rank) {
         }
     }
 
-    // Récupère l'utilisateur Discord (même s'il n'est pas dans le serveur)
+    // Fetch the Discord user (even if not in the server)
     const user = await client.users.fetch(targetId).catch(() => null);
 
     if (!user) {
@@ -1106,7 +1102,7 @@ async function handleWarnings(message, args) {
     }).join("\n\n");
 
     const embed = createEmbed(
-        `Warnings — ${userId}`,
+        `Warnings - ${userId}`,
         `**Active warnings:** ${warnings.length}\n\n${description}`,
         0xF1C40F
     );
@@ -1148,7 +1144,7 @@ async function handleHistory(message, args) {
     }).join("\n\n");
 
     const embed = createEmbed(
-        `Moderation History — ${userId}`,
+        `Moderation History - ${userId}`,
         `**Total recorded sanctions:** ${history.length}\n\n${description}`,
         0x5865F2
     );
@@ -1276,32 +1272,32 @@ async function handleStaffStats(message, args, rank) {
 async function handleHelp(message, rank) {
     const commands = [
         "**GENERAL COMMANDS**",
-        "`?help` — Display all commands",
+        "`?help` - Display all commands",
         "",
         "**MODERATION COMMANDS**",
-        "`?ban @member|USER_ID [reason]` — Ban a member (even if not in the server)",
-        "`?ipban @member|USER_ID [reason]` — Alias of ?ban",
-        "`?kick @member [reason]` — Kick a member",
-        "`?mute @member 10m [reason]` — Timeout a member",
-        "`?warn @member [reason]` — Warn a member",
-        "`?unban USER_ID [reason]` — Unban a user",
-        "`?unmute @member` — Remove a timeout",
+        "`?ban @member|USER_ID [reason]` - Ban a member (even if not in the server)",
+        "`?ipban @member|USER_ID [reason]` - Alias of ?ban",
+        "`?kick @member [reason]` - Kick a member",
+        "`?mute @member 10m [reason]` - Timeout a member",
+        "`?warn @member [reason]` - Warn a member",
+        "`?unban USER_ID [reason]` - Unban a user",
+        "`?unmute @member` - Remove a timeout",
         "",
         "**MEMBER MANAGEMENT**",
-        "`?managemember @member` — View moderation statistics",
-        "`?warnings @member` — View active warnings",
-        "`?history @member` — View moderation history",
-        "`?clearwarns @member [reason]` — Clear active warnings",
+        "`?managemember @member` - View moderation statistics",
+        "`?warnings @member` - View active warnings",
+        "`?history @member` - View moderation history",
+        "`?clearwarns @member [reason]` - Clear active warnings",
         "",
         "**SECURITY**",
-        "`?analyst all` — Scan all members for suspicious alt accounts (Supervisor+)",
+        "`?analyst all` - Scan all members for suspected alt accounts (Supervisor and above)",
         "",
         "**STAFF COMMANDS**",
-        "`?staffstats [@staff]` — View staff action statistics"
+        "`?staffstats [@staff]` - View staff action statistics"
     ];
 
     const embed = createEmbed(
-        "Moderation Bot — Commands",
+        "Moderation Bot - Commands",
         commands.join("\n"),
         0x5865F2
     );
@@ -1512,7 +1508,6 @@ async function shutdown(signal) {
     console.log(`${signal} received. Shutting down...`);
 
     saveAllData();
-    saveDeparted();
 
     server.close();
 
@@ -1534,7 +1529,6 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 async function startBot() {
     loadAllData();
-    departedData = loadJSON(DEPARTED_FILE, {});
 
     try {
         await client.login(TOKEN);
