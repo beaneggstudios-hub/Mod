@@ -29,7 +29,8 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildModeration
     ]
 });
 
@@ -365,6 +366,366 @@ async function checkStaff(message, minimumRank = "TRIAL_MODERATOR") {
     }
 
     return rank;
+}
+
+// ==========================================
+// ANALYST SYSTEM - détection d'alts / ban evasion
+// ?analyst all
+// ==========================================
+
+const ANALYST_ALERT_THRESHOLD = 50;                         // score minimum pour une alerte
+const ANALYST_DEPARTED_RETENTION = 90 * 24 * 60 * 60 * 1000; // départs gardés 90 jours
+const ANALYST_REJOIN_WINDOW = 7 * 24 * 60 * 60 * 1000;       // revenu sous 7 jours = suspect
+const ANALYST_NEW_ACCOUNT_AGE = 14 * 24 * 60 * 60 * 1000;    // compte < 14 jours = bonus
+
+const DEPARTED_FILE = path.join(DATA_FOLDER, "departed.json");
+let departedData = {};
+
+function saveDeparted() {
+    saveJSON(DEPARTED_FILE, departedData);
+}
+
+function pruneDeparted() {
+    const limit = Date.now() - ANALYST_DEPARTED_RETENTION;
+
+    for (const id of Object.keys(departedData)) {
+        if (departedData[id].leftAt < limit) {
+            delete departedData[id];
+        }
+    }
+}
+
+function normalizeName(str) {
+    return (str || "")
+        .toLowerCase()
+        .normalize("NFKD")
+        .replace(/[^a-z0-9]/g, "")
+        .replace(/\d+$/, ""); // enlève les chiffres de fin (user123 -> user)
+}
+
+function levenshtein(a, b) {
+    const dp = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+
+    for (let j = 1; j <= b.length; j++) dp[0][j] = j;
+
+    for (let i = 1; i <= a.length; i++) {
+        for (let j = 1; j <= b.length; j++) {
+            dp[i][j] = Math.min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+            );
+        }
+    }
+
+    return dp[a.length][b.length];
+}
+
+function nameSimilarity(a, b) {
+    if (!a || !b) return 0;
+
+    return 1 - levenshtein(a, b) / Math.max(a.length, b.length);
+}
+
+function profileFromUser(user, member) {
+    return {
+        id: user.id,
+        tag: user.tag,
+        username: user.username,
+        displayName: member?.displayName || user.globalName || user.username,
+        avatar: user.avatar || null,
+        createdAt: user.createdTimestamp,
+        joinedAt: member?.joinedTimestamp || null
+    };
+}
+
+// `old` = compte parti / banni / autre membre, `cur` = compte suspect
+function scorePair(old, cur) {
+    let score = 0;
+    const reasons = [];
+
+    if (old.avatar && old.avatar === cur.avatar) {
+        score += 40;
+        reasons.push("Même avatar personnalisé");
+    }
+
+    const a = normalizeName(old.username);
+    const b = normalizeName(cur.username);
+
+    if (a.length >= 3 && b.length >= 3) {
+        if (a === b) {
+            score += 40;
+            reasons.push("Pseudo identique (hors chiffres/symboles)");
+        } else {
+            const sim = nameSimilarity(a, b);
+
+            if (sim >= 0.8) {
+                score += 30;
+                reasons.push(`Pseudo très similaire (${Math.round(sim * 100)}%)`);
+            }
+        }
+    }
+
+    const da = normalizeName(old.displayName);
+    const db = normalizeName(cur.displayName);
+
+    if (da.length >= 3 && da === db && old.displayName !== old.username) {
+        score += 15;
+        reasons.push("Même nom d'affichage");
+    }
+
+    if (score > 0) {
+        if (
+            old.leftAt &&
+            cur.joinedAt &&
+            cur.joinedAt > old.leftAt &&
+            cur.joinedAt - old.leftAt <= ANALYST_REJOIN_WINDOW
+        ) {
+            score += 15;
+            reasons.push("Rejoint peu après le départ de l'ancien compte");
+        }
+
+        if (Date.now() - cur.createdAt < ANALYST_NEW_ACCOUNT_AGE) {
+            score += 10;
+            reasons.push("Compte Discord récent");
+        }
+    }
+
+    return { score, reasons };
+}
+
+function buildIndex(profiles) {
+    const index = new Map();
+
+    const add = (key, profile) => {
+        if (!index.has(key)) index.set(key, []);
+        index.get(key).push(profile);
+    };
+
+    for (const p of profiles) {
+        if (p.avatar) add("av:" + p.avatar, p);
+
+        const n = normalizeName(p.username);
+
+        if (n.length >= 3) {
+            add("nm:" + n, p);
+            add("px:" + n.slice(0, 4), p);
+        }
+
+        const d = normalizeName(p.displayName);
+
+        if (d.length >= 3) add("dn:" + d, p);
+    }
+
+    return index;
+}
+
+function candidatesFor(index, p) {
+    const keys = [];
+
+    if (p.avatar) keys.push("av:" + p.avatar);
+
+    const n = normalizeName(p.username);
+
+    if (n.length >= 3) keys.push("nm:" + n, "px:" + n.slice(0, 4));
+
+    const d = normalizeName(p.displayName);
+
+    if (d.length >= 3) keys.push("dn:" + d);
+
+    const found = new Map();
+
+    for (const key of keys) {
+        for (const candidate of (index.get(key) || []).slice(0, 50)) {
+            if (candidate.id !== p.id) found.set(candidate.id, candidate);
+        }
+    }
+
+    return [...found.values()];
+}
+
+function chunkFindings(findings, size) {
+    const out = [];
+
+    for (let i = 0; i < findings.length; i += size) {
+        out.push(findings.slice(i, i + size));
+    }
+
+    return out;
+}
+
+function buildAnalystEmbed(title, findings) {
+    const description = findings.map(({ cur, hits }) => {
+        const top = hits.slice(0, 3).map(h =>
+            `• **${h.old.source || "MEMBRE"}** ${h.old.tag} (\`${h.old.id}\`) — score **${h.score}**\n` +
+            `  ${h.reasons.join(", ")}`
+        ).join("\n");
+
+        return `⚠️ <@${cur.id}> (${cur.tag})\n${top}`;
+    }).join("\n\n");
+
+    return new EmbedBuilder()
+        .setTitle(title)
+        .setDescription(description.slice(0, 4000))
+        .setColor(0xED4245)
+        .setTimestamp();
+}
+
+async function sendAnalystAlert(guild, findings, title) {
+    const channelId = process.env.ANALYST_CHANNEL_ID;
+    const channel = channelId ? guild.channels.cache.get(channelId) : null;
+
+    if (!channel) return false;
+
+    for (const chunk of chunkFindings(findings, 5)) {
+        await channel.send({ embeds: [buildAnalystEmbed(title, chunk)] }).catch(() => {});
+    }
+
+    return true;
+}
+
+// Enregistre les membres qui quittent le serveur
+client.on("guildMemberRemove", (member) => {
+    if (!member.user) return;
+
+    departedData[member.id] = {
+        ...profileFromUser(member.user, member),
+        leftAt: Date.now()
+    };
+
+    pruneDeparted();
+    saveDeparted();
+});
+
+// Alerte automatique quand quelqu'un rejoint
+client.on("guildMemberAdd", async (member) => {
+    try {
+        if (member.user.bot) return;
+
+        const cur = profileFromUser(member.user, member);
+        const banned = await member.guild.bans.fetch().catch(() => null);
+
+        const pool = Object.values(departedData).map(d => ({ ...d, source: "A QUITTÉ" }));
+
+        if (banned) {
+            for (const ban of banned.values()) {
+                pool.push({
+                    ...profileFromUser(ban.user),
+                    source: "BANNI",
+                    leftAt: null
+                });
+            }
+        }
+
+        const index = buildIndex(pool);
+
+        const hits = candidatesFor(index, cur)
+            .map(old => ({ old, ...scorePair(old, cur) }))
+            .filter(h => h.score >= ANALYST_ALERT_THRESHOLD)
+            .sort((a, b) => b.score - a.score);
+
+        if (hits.length === 0) return;
+
+        await sendAnalystAlert(
+            member.guild,
+            [{ cur, hits }],
+            "Alerte : possible alt à l'arrivée"
+        );
+    } catch (error) {
+        console.error("Analyst join check error:", error);
+    }
+});
+
+async function handleAnalyst(message, args) {
+    if ((args[0] || "").toLowerCase() !== "all") {
+        return message.reply("Usage: `?analyst all`");
+    }
+
+    const status = await message.reply("🔍 Analyse en cours, cela peut prendre un moment...");
+
+    const guild = message.guild;
+    const members = await guild.members.fetch();
+    const banned = await guild.bans.fetch().catch(() => null);
+
+    const current = members
+        .filter(m => !m.user.bot)
+        .map(m => profileFromUser(m.user, m));
+
+    const departedPool = Object.values(departedData).map(d => ({ ...d, source: "A QUITTÉ" }));
+
+    const bannedPool = banned
+        ? [...banned.values()].map(b => ({
+            ...profileFromUser(b.user),
+            source: "BANNI",
+            leftAt: null
+        }))
+        : [];
+
+    const pastIndex = buildIndex([...departedPool, ...bannedPool]);
+    const currentIndex = buildIndex(current.map(c => ({ ...c, source: "MEMBRE ACTUEL" })));
+
+    const findings = [];
+    const seenPairs = new Set();
+
+    for (const cur of current) {
+        const hits = [];
+
+        // Comparaison avec les anciens comptes (partis / bannis)
+        for (const old of candidatesFor(pastIndex, cur)) {
+            const result = scorePair(old, cur);
+
+            if (result.score >= ANALYST_ALERT_THRESHOLD) {
+                hits.push({ old, ...result });
+            }
+        }
+
+        // Comparaison entre membres actuels (seuil plus strict)
+        for (const other of candidatesFor(currentIndex, cur)) {
+            const key = [cur.id, other.id].sort().join("-");
+
+            if (seenPairs.has(key)) continue;
+            seenPairs.add(key);
+
+            const result = scorePair(other, cur);
+
+            if (result.score >= ANALYST_ALERT_THRESHOLD + 10) {
+                hits.push({ old: { ...other, source: "MEMBRE ACTUEL" }, ...result });
+            }
+        }
+
+        if (hits.length) {
+            hits.sort((a, b) => b.score - a.score);
+            findings.push({ cur, hits });
+        }
+    }
+
+    findings.sort((a, b) => b.hits[0].score - a.hits[0].score);
+
+    const summary =
+        `✅ Analyse terminée.\n` +
+        `**Membres analysés :** ${current.length}\n` +
+        `**Anciens comptes comparés :** ${departedPool.length + bannedPool.length}\n` +
+        `**Comptes suspects :** ${findings.length}`;
+
+    await status.edit(summary).catch(() => message.reply(summary));
+
+    if (findings.length === 0) return;
+
+    const sentToChannel = await sendAnalystAlert(
+        guild,
+        findings.slice(0, 25),
+        "Rapport d'analyse : alts suspects"
+    );
+
+    if (!sentToChannel) {
+        for (const chunk of chunkFindings(findings.slice(0, 15), 5)) {
+            await message.channel.send({
+                embeds: [buildAnalystEmbed("Rapport d'analyse : alts suspects", chunk)]
+            });
+        }
+    } else {
+        await message.channel.send("📨 Le rapport détaillé a été envoyé dans le salon d'alertes.");
+    }
 }
 
 // ==========================================
@@ -932,6 +1293,9 @@ async function handleHelp(message, rank) {
         "`?history @member` — View moderation history",
         "`?clearwarns @member [reason]` — Clear active warnings",
         "",
+        "**SECURITY**",
+        "`?analyst all` — Scan all members for suspicious alt accounts (Supervisor+)",
+        "",
         "**STAFF COMMANDS**",
         "`?staffstats [@staff]` — View staff action statistics"
     ];
@@ -988,6 +1352,7 @@ const KNOWN_COMMANDS = [
     "history",
     "clearwarns",
     "staffstats",
+    "analyst",
     "checkthisfemboy"
 ];
 
@@ -1070,6 +1435,10 @@ client.on("messageCreate", async (message) => {
 
             case "staffstats":
                 return await handleStaffStats(message, args, rank);
+
+            case "analyst":
+                if (!hasPermission(rank, "SUPERVISOR")) break;
+                return await handleAnalyst(message, args);
         }
 
         await message.reply(
@@ -1089,7 +1458,7 @@ client.on("messageCreate", async (message) => {
 // BOT READY EVENT
 // ==========================================
 
-client.once("ready", () => {
+client.once("clientReady", () => {
     console.log("================================");
     console.log(`Logged in as ${client.user.tag}`);
     console.log(`Bot ID: ${client.user.id}`);
@@ -1143,6 +1512,7 @@ async function shutdown(signal) {
     console.log(`${signal} received. Shutting down...`);
 
     saveAllData();
+    saveDeparted();
 
     server.close();
 
@@ -1164,6 +1534,7 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 async function startBot() {
     loadAllData();
+    departedData = loadJSON(DEPARTED_FILE, {});
 
     try {
         await client.login(TOKEN);
